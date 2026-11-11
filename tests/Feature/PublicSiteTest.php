@@ -2,6 +2,7 @@
 
 namespace Tests\Feature;
 
+use App\Mail\ContactMessageReceived;
 use App\Models\Blog;
 use App\Models\BlogComment;
 use App\Models\Contact;
@@ -11,8 +12,12 @@ use App\Models\Project;
 use App\Models\Setting;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Http\UploadedFile;
+use Illuminate\Mail\Mailables\Attachment;
+use Illuminate\Support\Facades\Exceptions;
+use Illuminate\Support\Facades\Mail;
 use Illuminate\Support\Facades\Storage;
 use Inertia\Testing\AssertableInertia as Assert;
+use Symfony\Component\Mailer\Exception\TransportException;
 use Tests\TestCase;
 
 class PublicSiteTest extends TestCase
@@ -116,6 +121,45 @@ class PublicSiteTest extends TestCase
         $this->assertSame(0, Contact::query()->count());
     }
 
+    public function test_contact_message_is_emailed_to_the_site_address_with_reply_to_and_attachment(): void
+    {
+        Storage::fake('local');
+        Mail::fake();
+        Setting::putMany(['email' => 'owner@example.com']);
+
+        $this->post('/contact', [
+            'name' => 'Awa Ndiaye',
+            'email' => 'awa@example.com',
+            'subject' => 'Application de livraison',
+            'message' => 'Bonjour, je souhaite une application de livraison.',
+            'attachment' => UploadedFile::fake()->create('cahier.pdf', 500, 'application/pdf'),
+        ])->assertSessionHas('success', 'message_sent');
+
+        Mail::assertSent(ContactMessageReceived::class, fn (ContactMessageReceived $mail): bool => $mail->hasTo('owner@example.com')
+            && $mail->hasReplyTo('awa@example.com', 'Awa Ndiaye')
+            && $mail->hasSubject('Portfolio — Application de livraison')
+            && $mail->hasAttachment(
+                Attachment::fromStorageDisk('local', Contact::query()->sole()->attachment),
+                ['as' => 'cahier.pdf', 'mime' => 'application/pdf'],
+            ));
+    }
+
+    public function test_contact_message_is_kept_and_confirmed_when_the_email_cannot_be_sent(): void
+    {
+        Exceptions::fake();
+        Setting::putMany(['email' => 'owner@example.com']);
+        Mail::shouldReceive('to')->andThrow(new TransportException('SMTP unreachable'));
+
+        $this->post('/contact', [
+            'name' => 'Awa Ndiaye',
+            'email' => 'awa@example.com',
+            'message' => 'Bonjour, je souhaite une application de livraison.',
+        ])->assertSessionHas('success', 'message_sent');
+
+        $this->assertSame(1, Contact::query()->count());
+        Exceptions::assertReported(TransportException::class);
+    }
+
     public function test_contact_upload_above_php_post_limit_returns_a_form_error(): void
     {
         $this->from('/')
@@ -128,6 +172,8 @@ class PublicSiteTest extends TestCase
 
     public function test_contact_honeypot_silently_drops_spam(): void
     {
+        Mail::fake();
+
         $this->post('/contact', [
             'name' => 'Bot',
             'email' => 'bot@example.com',
@@ -136,6 +182,7 @@ class PublicSiteTest extends TestCase
         ])->assertSessionHas('success', 'message_sent');
 
         $this->assertSame(0, Contact::query()->count());
+        Mail::assertNotSent(ContactMessageReceived::class);
     }
 
     public function test_comments_wait_for_approval_before_being_shown(): void
